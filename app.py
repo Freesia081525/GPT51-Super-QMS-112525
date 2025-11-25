@@ -1,13 +1,12 @@
 import os
 import time
 import uuid
-import yaml
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Literal, Any
 
 import streamlit as st
+import yaml
 import plotly.express as px
-import plotly.graph_objects as go
 
 # ---- Optional Provider SDK imports (guarded) ----
 try:
@@ -32,6 +31,7 @@ except ImportError:
     XAIClient = None
     xai_user = None
     xai_system = None
+
 
 # ------------------- PROMPTS ----------------------
 
@@ -88,9 +88,11 @@ SMART_REPLACE_SYSTEM_PROMPT = """
 5. 僅對「實際有插入或變動」的內容加上 span 標記，其餘內容維持原樣。
 """
 
+
 # ------------------- DATA MODELS ------------------
 
 ProviderLiteral = Literal["gemini", "openai", "anthropic", "grok"]
+
 
 @dataclass
 class AgentConfig:
@@ -103,6 +105,7 @@ class AgentConfig:
     user_prompt: str
     system_prompt_suffix: str = ""
 
+
 @dataclass
 class AgentRunState:
     status: Literal["idle", "running", "completed", "error"] = "idle"
@@ -112,6 +115,7 @@ class AgentRunState:
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
 
+
 @dataclass
 class PipelineState:
     template: str = ""
@@ -119,6 +123,7 @@ class PipelineState:
     current_step_index: int = 0
     agents: List[AgentConfig] = field(default_factory=list)
     history: Dict[str, AgentRunState] = field(default_factory=dict)
+
 
 # ------------------- THEME ENGINE -----------------
 
@@ -144,6 +149,7 @@ FLOWER_THEMES = {
     "Tulip": {"primary": "#e06666", "secondary": "#ffe2e2", "accent": "#cc0000"},
     "Wisteria": {"primary": "#b4a7d6", "secondary": "#f3ecff", "accent": "#8e7cc3"},
 }
+
 
 def apply_theme(theme_name: str, dark_mode: bool):
     theme = FLOWER_THEMES.get(theme_name, FLOWER_THEMES["Sakura"])
@@ -188,14 +194,45 @@ def apply_theme(theme_name: str, dark_mode: bool):
     """
     st.markdown(css, unsafe_allow_html=True)
 
+
 # ------------------- PROVIDER HELPERS ----------------
 
 def get_api_key(name: str, ui_value: Optional[str]) -> Optional[str]:
-    # Prefer environment; fall back to UI field if env is empty
+    """Prefer environment variable; fallback to UI input."""
     env_val = os.getenv(name)
     if env_val:
         return env_val
     return ui_value or None
+
+
+def _extract_gemini_text(resp) -> str:
+    """
+    Safely extract text from a google-generativeai response.
+    Avoids resp.text quick accessor, which can raise if no valid Part exists.
+    """
+    chunks: List[str] = []
+
+    candidates = getattr(resp, "candidates", None) or []
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        for p in parts:
+            text = getattr(p, "text", None) or (p.get("text") if isinstance(p, dict) else None)
+            if text:
+                chunks.append(text)
+
+    if chunks:
+        return "\n".join(chunks).strip()
+
+    # Fallback to quick accessor; swallow any errors
+    try:
+        txt = getattr(resp, "text", "") or ""
+        return txt.strip()
+    except Exception:
+        return ""
+
 
 def call_gemini(
     model: str,
@@ -210,14 +247,12 @@ def call_gemini(
 
     genai.configure(api_key=api_key)
 
-    # Use system_instruction properly
     gemini_model = genai.GenerativeModel(
         model_name=model,
         system_instruction=system_prompt,
     )
 
     start = time.time()
-    # User content goes separately; system prompt is handled by system_instruction
     resp = gemini_model.generate_content(
         user_content,
         generation_config={
@@ -229,7 +264,6 @@ def call_gemini(
 
     text = _extract_gemini_text(resp)
 
-    # Try to access finish_reason / usage for better diagnostics
     finish_reason = None
     candidates = getattr(resp, "candidates", None) or []
     if candidates:
@@ -238,15 +272,14 @@ def call_gemini(
 
     usage = getattr(resp, "usage_metadata", None)
 
-    # If no text was produced at all, raise a helpful error
     if not text:
         msg = "Gemini returned no content. "
         if finish_reason:
             msg += f"(finish_reason={finish_reason}) "
         msg += (
             "This often happens when safety filters block the output or the model "
-            "halts before producing text. Try simplifying or redacting the input, "
-            "or switch to another provider/model."
+            "halts before producing text. Try simplifying/redacting the input, or "
+            "switching to another provider/model."
         )
         raise RuntimeError(msg)
 
@@ -256,6 +289,8 @@ def call_gemini(
         "input_tokens": getattr(usage, "prompt_token_count", None) if usage else None,
         "output_tokens": getattr(usage, "candidates_token_count", None) if usage else None,
     }
+
+
 def call_openai(
     model: str,
     api_key: str,
@@ -288,6 +323,7 @@ def call_openai(
         "output_tokens": getattr(usage, "completion_tokens", None) if usage else None,
     }
 
+
 def call_anthropic(
     model: str,
     api_key: str,
@@ -308,7 +344,11 @@ def call_anthropic(
         messages=[{"role": "user", "content": user_content}],
     )
     elapsed = (time.time() - start) * 1000
-    text = "".join(block.text for block in resp.content if block.type == "text")
+    text_chunks: List[str] = []
+    for block in getattr(resp, "content", []):
+        if getattr(block, "type", None) == "text":
+            text_chunks.append(block.text)
+    text = "\n".join(text_chunks)
     usage = getattr(resp, "usage", None)
     return {
         "text": text,
@@ -316,6 +356,7 @@ def call_anthropic(
         "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
         "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
     }
+
 
 def call_grok(
     model: str,
@@ -326,10 +367,11 @@ def call_grok(
     temperature: float,
 ) -> Dict[str, Any]:
     """
-    Sample Grok (xAI) call, adapted from provided snippet.
+    Sample Grok (xAI) call, adapted from the official snippet.
     """
     if XAIClient is None or xai_user is None or xai_system is None:
         raise RuntimeError("xai_sdk not installed.")
+
     client = XAIClient(api_key=api_key, timeout=3600)
     start = time.time()
     chat = client.chat.create(model=model)
@@ -342,7 +384,7 @@ def call_grok(
         }
     )
     elapsed = (time.time() - start) * 1000
-    text = getattr(response, "content", "")
+    text = getattr(response, "content", "") or ""
     usage = getattr(response, "usage", None)
     return {
         "text": text,
@@ -350,6 +392,7 @@ def call_grok(
         "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
         "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
     }
+
 
 def call_llm(
     agent: AgentConfig,
@@ -408,35 +451,6 @@ def call_llm(
         )
     raise RuntimeError(f"Unsupported provider: {provider}")
 
-# GEMINI new code 
-def _extract_gemini_text(resp) -> str:
-    """
-    Safely extract text from a google-generativeai response.
-    Avoids resp.text quick accessor, which can raise when no parts exist.
-    """
-    # Try to collect text from candidates/parts
-    chunks = []
-    candidates = getattr(resp, "candidates", None) or []
-    for cand in candidates:
-        content = getattr(cand, "content", None)
-        if not content:
-            continue
-        parts = getattr(content, "parts", None) or []
-        for p in parts:
-            # parts may be objects with .text, or dict-like
-            text = getattr(p, "text", None) or (p.get("text") if isinstance(p, dict) else None)
-            if text:
-                chunks.append(text)
-
-    if chunks:
-        return "\n".join(chunks).strip()
-
-    # Fallback: try the quick accessor, but don't let it crash
-    try:
-        txt = getattr(resp, "text", "") or ""
-        return txt.strip()
-    except Exception:
-        return ""
 
 # ------------------- PIPELINE LOGIC ----------------
 
@@ -452,7 +466,7 @@ def build_agent_input(
         prev_state = pipeline.history.get(prev_agent.id)
         prev_output = prev_state.output if prev_state else ""
 
-    combined_system = base_system_prompt + "\n\n" + agent.system_prompt_suffix
+    combined_system = base_system_prompt + "\n\n" + (agent.system_prompt_suffix or "")
 
     user_context = f"""[Template]
 {pipeline.template}
@@ -467,6 +481,7 @@ def build_agent_input(
 {agent.user_prompt}
 """
     return {"system": combined_system, "user": user_context}
+
 
 def run_agent(
     pipeline: PipelineState,
@@ -490,7 +505,12 @@ def run_agent(
     except Exception as e:
         state.status = "error"
         state.error = str(e)
+        try:
+            log_event("error", f"Agent '{agent.name}' failed: {e}")
+        except Exception:
+            pass
     return state
+
 
 def run_full_pipeline(
     pipeline: PipelineState,
@@ -498,6 +518,7 @@ def run_full_pipeline(
 ):
     for i in range(len(pipeline.agents)):
         run_agent(pipeline, i, api_keys)
+
 
 # ------------------- SMART REPLACEMENT --------------
 
@@ -528,18 +549,39 @@ def run_smart_replace(
     )
     return call_llm(dummy_agent, SMART_REPLACE_SYSTEM_PROMPT, user_content, api_keys)
 
+
 # ------------------- AGENT YAML UTILITIES -----------
 
-def load_agents_from_yaml(path: str = "agents.yaml") -> PipelineState:
+def load_agents_from_yaml(path: Optional[str] = "agents.yaml") -> PipelineState:
+    """
+    Safely load agents.yaml. If the file is missing or invalid, return
+    an empty/default PipelineState instead of crashing.
+    """
+    if not path:
+        return PipelineState()
+
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            raw = f.read().strip()
+            if not raw:
+                return PipelineState()
+            data = yaml.safe_load(raw)
     except FileNotFoundError:
         return PipelineState()
-    pipe = data.get("pipeline", {})
-    agents_data = pipe.get("agents", [])
+    except yaml.YAMLError as e:
+        print(f"[agents.yaml] YAML parse error, ignoring file: {e}")
+        return PipelineState()
+
+    if not isinstance(data, dict):
+        return PipelineState()
+
+    pipe = data.get("pipeline", {}) or {}
+    agents_data = pipe.get("agents", []) or []
+
     agents: List[AgentConfig] = []
     for a in agents_data:
+        if not isinstance(a, dict):
+            continue
         agents.append(
             AgentConfig(
                 id=a.get("id") or str(uuid.uuid4()),
@@ -552,13 +594,15 @@ def load_agents_from_yaml(path: str = "agents.yaml") -> PipelineState:
                 system_prompt_suffix=a.get("system_prompt_suffix", ""),
             )
         )
+
     return PipelineState(
-        template=pipe.get("template", ""),
-        observations=pipe.get("observations", ""),
+        template=pipe.get("template", "") or "",
+        observations=pipe.get("observations", "") or "",
         current_step_index=0,
         agents=agents,
         history={},
     )
+
 
 def export_agents_to_yaml(pipeline: PipelineState) -> str:
     data = {
@@ -569,6 +613,7 @@ def export_agents_to_yaml(pipeline: PipelineState) -> str:
         }
     }
     return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+
 
 # ------------------- LANGUAGE LABELS ----------------
 
@@ -613,7 +658,7 @@ UI_LABELS = {
         "gemini_key": "Gemini API 金鑰",
         "openai_key": "OpenAI API 金鑰",
         "anthropic_key": "Anthropic API 金鑰",
-        "grok_key": "XAI (Grok) API 金鑰",
+        "grok_key": "XAI (Grok) 金鑰",
         "theme": "花卉主題",
         "dark_mode": "深色模式",
         "language": "介面語言",
@@ -627,6 +672,7 @@ UI_LABELS = {
     },
 }
 
+
 # ------------------- WOW STATUS BADGE --------------
 
 def render_status_badge(status: str):
@@ -636,16 +682,21 @@ def render_status_badge(status: str):
         "completed": "DONE",
         "error": "ERROR",
     }
-    html = f'<span class="status-badge status-{status}">{label_map.get(status,status).upper()}</span>'
+    html = f'<span class="status-badge status-{status}">{label_map.get(status, status).upper()}</span>'
     st.markdown(html, unsafe_allow_html=True)
 
-# ------------------- STREAMLIT APP -----------------
+
+# ------------------- SESSION STATE & LOGGING -------
 
 def init_session_state():
     if "pipeline" not in st.session_state:
         st.session_state.pipeline = load_agents_from_yaml()
     if "smart_result" not in st.session_state:
         st.session_state.smart_result = ""
+    if "smart_template" not in st.session_state:
+        st.session_state.smart_template = st.session_state.pipeline.template or ""
+    if "smart_list" not in st.session_state:
+        st.session_state.smart_list = st.session_state.pipeline.observations or ""
     if "ui_language" not in st.session_state:
         st.session_state.ui_language = "zh"
     if "theme_name" not in st.session_state:
@@ -662,10 +713,14 @@ def init_session_state():
             "grok": "",
         }
 
+
 def log_event(level: str, message: str):
     st.session_state.log_entries.append(
         {"level": level, "message": message, "ts": time.strftime("%H:%M:%S")}
     )
+
+
+# ------------------- STREAMLIT APP -----------------
 
 def main():
     st.set_page_config(
@@ -678,11 +733,10 @@ def main():
     lang = st.session_state.ui_language
     labels = UI_LABELS[lang]
 
-    # Top bar: theme & language
+    # Sidebar: API keys, language, theme, YAML
     with st.sidebar:
         st.markdown(f"### {labels['api_keys']}")
 
-        # API Keys (env preferred, UI as fallback)
         gemini_ui = st.text_input(labels["gemini_key"], type="password")
         openai_ui = st.text_input(labels["openai_key"], type="password")
         anthropic_ui = st.text_input(labels["anthropic_key"], type="password")
@@ -696,7 +750,9 @@ def main():
         st.markdown("---")
         st.markdown("### UI")
         lang_choice = st.radio(
-            labels["language"], options=["zh", "en"], index=0 if lang == "zh" else 1
+            labels["language"],
+            options=["zh", "en"],
+            index=0 if lang == "zh" else 1,
         )
         st.session_state.ui_language = lang_choice
         labels = UI_LABELS[lang_choice]
@@ -708,11 +764,11 @@ def main():
 
         if st.button(labels["style_wheel"]):
             import random
+
             choice = random.choice(list(FLOWER_THEMES.keys()))
             st.session_state.theme_name = choice
             log_event("info", f"Lucky wheel selected theme: {choice}")
 
-        # Agents YAML export/import
         st.markdown("---")
         st.markdown("### agents.yaml")
         if st.button("Reload agents.yaml from disk"):
@@ -720,45 +776,58 @@ def main():
             log_event("info", "Reloaded agents.yaml")
 
         yaml_str = export_agents_to_yaml(st.session_state.pipeline)
-        st.download_button("Download current agents.yaml", data=yaml_str,
-                           file_name="agents.yaml", mime="text/yaml")
+        st.download_button(
+            "Download current agents.yaml",
+            data=yaml_str,
+            file_name="agents.yaml",
+            mime="text/yaml",
+        )
 
         uploaded_yaml = st.file_uploader("Upload agents.yaml", type=["yaml", "yml"])
         if uploaded_yaml:
-            data = yaml.safe_load(uploaded_yaml.read())
-            pipe = data.get("pipeline", {})
-            new_state = load_agents_from_yaml(path=None)
-            # manual construction from uploaded data
-            agents_data = pipe.get("agents", [])
-            agents: List[AgentConfig] = []
-            for a in agents_data:
-                agents.append(
-                    AgentConfig(
-                        id=a.get("id") or str(uuid.uuid4()),
-                        name=a.get("name", "Unnamed"),
-                        provider=a.get("provider", "gemini"),
-                        model=a.get("model", "gemini-2.5-flash"),
-                        max_tokens=int(a.get("max_tokens", 2048)),
-                        temperature=float(a.get("temperature", 0.2)),
-                        user_prompt=a.get("user_prompt", ""),
-                        system_prompt_suffix=a.get("system_prompt_suffix", ""),
-                    )
-                )
-            st.session_state.pipeline = PipelineState(
-                template=pipe.get("template", ""),
-                observations=pipe.get("observations", ""),
-                current_step_index=0,
-                agents=agents,
-                history={},
-            )
-            log_event("success", "Loaded agents from uploaded YAML.")
+            try:
+                uploaded_text = uploaded_yaml.read()
+                if isinstance(uploaded_text, bytes):
+                    uploaded_text = uploaded_text.decode("utf-8", errors="replace")
+                uploaded_text = uploaded_text.strip()
+                data = yaml.safe_load(uploaded_text) if uploaded_text else {}
+            except yaml.YAMLError as e:
+                st.error(f"Uploaded YAML is invalid: {e}")
+            else:
+                pipe = (data or {}).get("pipeline", {}) if isinstance(data, dict) else {}
+                agents_data = pipe.get("agents", []) or []
 
-    # Apply theme CSS
+                agents: List[AgentConfig] = []
+                for a in agents_data:
+                    if not isinstance(a, dict):
+                        continue
+                    agents.append(
+                        AgentConfig(
+                            id=a.get("id") or str(uuid.uuid4()),
+                            name=a.get("name", "Unnamed"),
+                            provider=a.get("provider", "gemini"),
+                            model=a.get("model", "gemini-2.5-flash"),
+                            max_tokens=int(a.get("max_tokens", 2048)),
+                            temperature=float(a.get("temperature", 0.2)),
+                            user_prompt=a.get("user_prompt", ""),
+                            system_prompt_suffix=a.get("system_prompt_suffix", ""),
+                        )
+                    )
+
+                st.session_state.pipeline = PipelineState(
+                    template=pipe.get("template", "") or "",
+                    observations=pipe.get("observations", "") or "",
+                    current_step_index=0,
+                    agents=agents,
+                    history={},
+                )
+                log_event("success", "Loaded agents from uploaded YAML.")
+
     apply_theme(st.session_state.theme_name, st.session_state.dark_mode)
 
     st.markdown(f"## {labels['title']}")
 
-    # Resolve effective API keys (env or UI; env not displayed)
+    # Effective API keys
     api_keys = {
         "gemini": get_api_key("GEMINI_API_KEY", st.session_state.manual_api_keys["gemini"]),
         "openai": get_api_key("OPENAI_API_KEY", st.session_state.manual_api_keys["openai"]),
@@ -793,12 +862,13 @@ def main():
                         options=["gemini", "openai", "anthropic", "grok"],
                         index=["gemini", "openai", "anthropic", "grok"].index(
                             agent.provider
-                        ),
+                        )
+                        if agent.provider in ["gemini", "openai", "anthropic", "grok"]
+                        else 0,
                         key=f"provider_{agent.id}",
                     )
                     agent.provider = provider
                 with c2:
-                    # model presets per provider
                     if provider == "gemini":
                         models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
                     elif provider == "openai":
@@ -819,7 +889,7 @@ def main():
                         "Max tokens",
                         min_value=256,
                         max_value=32000,
-                        value=agent.max_tokens,
+                        value=int(agent.max_tokens),
                         step=256,
                         key=f"max_tokens_{agent.id}",
                     )
@@ -834,7 +904,10 @@ def main():
                     )
 
                 agent.user_prompt = st.text_area(
-                    "User Prompt", value=agent.user_prompt, height=120, key=f"up_{agent.id}"
+                    "User Prompt",
+                    value=agent.user_prompt,
+                    height=120,
+                    key=f"up_{agent.id}",
                 )
                 agent.system_prompt_suffix = st.text_area(
                     "System Prompt Suffix",
@@ -843,35 +916,64 @@ def main():
                     key=f"sp_{agent.id}",
                 )
 
-                # Status & run
+                effective_api_keys = {
+                    "gemini": api_keys["gemini"],
+                    "openai": api_keys["openai"],
+                    "anthropic": api_keys["anthropic"],
+                    "grok": api_keys["grok"],
+                }
+                if not effective_api_keys[agent.provider]:
+                    st.warning(
+                        f"No API key configured for provider `{agent.provider}`. "
+                        "Set it in environment or sidebar before running this agent."
+                    )
+
+                # ----------------- Status & run -----------------
                 state = pipeline.history.get(agent.id, AgentRunState())
+
                 col_run1, col_run2, col_status = st.columns([1, 1, 2])
                 with col_run1:
                     if st.button(labels["run_agent"], key=f"run_{agent.id}"):
-                        log_event("info", f"Running agent {agent.name}.")
+                        log_event(
+                            "info",
+                            f"Running agent {agent.name}. (provider={agent.provider}, model={agent.model})",
+                        )
                         new_state = run_agent(pipeline, idx, api_keys)
                         pipeline.history[agent.id] = new_state
+                        state = new_state
+
                 with col_run2:
                     render_status_badge(state.status)
+
                 with col_status:
                     if state.latency_ms is not None:
                         st.caption(f"Latency: {state.latency_ms:.0f} ms")
 
-                # Editable output
-                current_output = state.output or ""
+                if state.error:
+                    st.error(f"Error: {state.error}")
+
+                # -------------- Editable output (fixed) --------------
+                output_key = f"out_{agent.id}"
+
+                if output_key not in st.session_state:
+                    st.session_state[output_key] = state.output or ""
+
+                if state.status in ("completed", "error"):
+                    st.session_state[output_key] = state.output or st.session_state[output_key]
+
                 new_output = st.text_area(
                     labels["agent_output"],
-                    value=current_output,
+                    key=output_key,
                     height=200,
-                    key=f"out_{agent.id}",
                 )
-                if new_output != current_output:
+
+                if new_output != (state.output or ""):
                     state.output = new_output
                     pipeline.history[agent.id] = state
 
                 st.download_button(
                     labels["export_md"],
-                    data=new_output,
+                    data=new_output or "",
                     file_name=f"{agent.id}.md",
                     mime="text/markdown",
                     key=f"dl_{agent.id}",
@@ -885,20 +987,27 @@ def main():
 
     # ----------------- SMART REPLACE TAB -------------
     with tabs[1]:
+        pipeline: PipelineState = st.session_state.pipeline
+
         colL, colR = st.columns(2)
         with colL:
             smart_template = st.text_area(
-                labels["smart_template"], height=260, key="smart_template"
+                labels["smart_template"],
+                height=260,
+                key="smart_template",
             )
             smart_list = st.text_area(
-                labels["smart_list"], height=260, key="smart_list"
+                labels["smart_list"],
+                height=260,
+                key="smart_list",
             )
 
-            sr_provider = st.selectbox(
+            sr_provider: ProviderLiteral = st.selectbox(
                 "Provider",
                 options=["gemini", "openai", "anthropic", "grok"],
                 key="sr_provider",
             )
+
             if sr_provider == "gemini":
                 models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
             elif sr_provider == "openai":
@@ -910,13 +1019,43 @@ def main():
 
             sr_model = st.selectbox("Model", options=models, key="sr_model")
             sr_max_tokens = st.number_input(
-                "Max tokens", min_value=256, max_value=32000, value=4096, step=256
+                "Max tokens",
+                min_value=256,
+                max_value=32000,
+                value=4096,
+                step=256,
+                key="sr_max_tokens",
             )
             sr_temp = st.slider(
-                "Temp", min_value=0.0, max_value=1.0, value=0.2, step=0.05
+                "Temp",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.2,
+                step=0.05,
+                key="sr_temp",
             )
 
-            if st.button(labels["smart_run"]):
+            provider_key_map = {
+                "gemini": "GEMINI_API_KEY",
+                "openai": "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "grok": "XAI_API_KEY",
+            }
+            effective_api_keys = {
+                "gemini": api_keys["gemini"],
+                "openai": api_keys["openai"],
+                "anthropic": api_keys["anthropic"],
+                "grok": api_keys["grok"],
+            }
+
+            if not effective_api_keys[sr_provider]:
+                env_name = provider_key_map[sr_provider]
+                st.warning(
+                    f"No API key found for provider `{sr_provider}`. "
+                    f"Set the environment variable `{env_name}` or enter a key in the sidebar."
+                )
+
+            if st.button(labels["smart_run"], key="smart_run_button"):
                 log_event("info", "Running Smart Replace.")
                 try:
                     res = run_smart_replace(
@@ -924,14 +1063,22 @@ def main():
                         list_b=smart_list,
                         provider=sr_provider,
                         model=sr_model,
-                        max_tokens=sr_max_tokens,
-                        temperature=sr_temp,
-                        api_keys=api_keys,
+                        max_tokens=int(sr_max_tokens),
+                        temperature=float(sr_temp),
+                        api_keys=effective_api_keys,
                     )
-                    st.session_state.smart_result = res["text"]
-                    log_event("success", "Smart Replace completed.")
+                    result_text = res.get("text") or ""
+                    st.session_state.smart_result = result_text
+                    if not result_text.strip():
+                        st.warning(
+                            "Smart Replace completed but returned an empty response. "
+                            "This can happen due to safety filters or model limits."
+                        )
+                    else:
+                        log_event("success", "Smart Replace completed.")
                 except Exception as e:
                     log_event("error", f"Smart Replace failed: {e}")
+                    st.error(f"Smart Replace error: {e}")
 
         with colR:
             view_mode = st.radio(
@@ -939,7 +1086,10 @@ def main():
             )
             result = st.session_state.smart_result
             if view_mode == labels["smart_preview"]:
-                st.markdown(result, unsafe_allow_html=True)
+                if result.strip():
+                    st.markdown(result, unsafe_allow_html=True)
+                else:
+                    st.info("No Smart Replace result yet. Run it from the left panel.")
             else:
                 st.code(result or "", language="markdown")
             st.download_button(
@@ -966,7 +1116,6 @@ def main():
         c3.metric("Input Tokens", total_input_tokens or "–")
         c4.metric("Output Tokens", total_output_tokens or "–")
 
-        # Interactive charts
         if pipeline.agents:
             names = [a.name for a in pipeline.agents]
             latencies = [
@@ -1001,7 +1150,7 @@ def main():
                 st.plotly_chart(fig_tok, use_container_width=True)
 
         st.markdown("### Logs")
-        for entry in reversed(st.session_state.log_entries[-100:]):
+        for entry in reversed(st.session_state.log_entries[-200:]):
             color = {"info": "#60a5fa", "success": "#22c55e", "error": "#ef4444"}.get(
                 entry["level"], "#9ca3af"
             )
@@ -1010,6 +1159,7 @@ def main():
                 f"<span>{entry['message']}</span>",
                 unsafe_allow_html=True,
             )
+
 
 if __name__ == "__main__":
     main()
