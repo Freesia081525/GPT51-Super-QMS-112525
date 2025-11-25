@@ -209,11 +209,17 @@ def call_gemini(
         raise RuntimeError("google-generativeai SDK not installed.")
 
     genai.configure(api_key=api_key)
-    client = genai.GenerativeModel(model)
+
+    # Use system_instruction properly
+    gemini_model = genai.GenerativeModel(
+        model_name=model,
+        system_instruction=system_prompt,
+    )
 
     start = time.time()
-    resp = client.generate_content(
-        [{"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_content}]}],
+    # User content goes separately; system prompt is handled by system_instruction
+    resp = gemini_model.generate_content(
+        user_content,
         generation_config={
             "max_output_tokens": max_tokens,
             "temperature": temperature,
@@ -223,25 +229,24 @@ def call_gemini(
 
     text = _extract_gemini_text(resp)
 
-    # Try to capture finish_reason / safety info for better errors
+    # Try to access finish_reason / usage for better diagnostics
     finish_reason = None
-    if hasattr(resp, "candidates") and resp.candidates:
-        # API-specific: candidate.finish_reason may be enum/int/string
-        fr = getattr(resp.candidates[0], "finish_reason", None)
+    candidates = getattr(resp, "candidates", None) or []
+    if candidates:
+        fr = getattr(candidates[0], "finish_reason", None)
         finish_reason = str(fr) if fr is not None else None
 
     usage = getattr(resp, "usage_metadata", None)
 
-    # If still no text, surface a helpful message instead of silently failing
+    # If no text was produced at all, raise a helpful error
     if not text:
-        # Try to detect safety block or other non-normal stop
         msg = "Gemini returned no content. "
         if finish_reason:
             msg += f"(finish_reason={finish_reason}) "
         msg += (
             "This often happens when safety filters block the output or the model "
-            "stops before producing text. Please try simplifying/redacting the input, "
-            "loosening safety settings (if allowed), or switching provider/model."
+            "halts before producing text. Try simplifying or redacting the input, "
+            "or switch to another provider/model."
         )
         raise RuntimeError(msg)
 
