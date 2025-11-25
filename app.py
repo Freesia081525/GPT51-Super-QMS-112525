@@ -207,8 +207,10 @@ def call_gemini(
 ) -> Dict[str, Any]:
     if genai is None:
         raise RuntimeError("google-generativeai SDK not installed.")
+
     genai.configure(api_key=api_key)
     client = genai.GenerativeModel(model)
+
     start = time.time()
     resp = client.generate_content(
         [{"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_content}]}],
@@ -218,15 +220,37 @@ def call_gemini(
         },
     )
     elapsed = (time.time() - start) * 1000
-    text = resp.text or ""
+
+    text = _extract_gemini_text(resp)
+
+    # Try to capture finish_reason / safety info for better errors
+    finish_reason = None
+    if hasattr(resp, "candidates") and resp.candidates:
+        # API-specific: candidate.finish_reason may be enum/int/string
+        fr = getattr(resp.candidates[0], "finish_reason", None)
+        finish_reason = str(fr) if fr is not None else None
+
     usage = getattr(resp, "usage_metadata", None)
+
+    # If still no text, surface a helpful message instead of silently failing
+    if not text:
+        # Try to detect safety block or other non-normal stop
+        msg = "Gemini returned no content. "
+        if finish_reason:
+            msg += f"(finish_reason={finish_reason}) "
+        msg += (
+            "This often happens when safety filters block the output or the model "
+            "stops before producing text. Please try simplifying/redacting the input, "
+            "loosening safety settings (if allowed), or switching provider/model."
+        )
+        raise RuntimeError(msg)
+
     return {
         "text": text,
         "latency_ms": elapsed,
         "input_tokens": getattr(usage, "prompt_token_count", None) if usage else None,
         "output_tokens": getattr(usage, "candidates_token_count", None) if usage else None,
     }
-
 def call_openai(
     model: str,
     api_key: str,
@@ -378,6 +402,36 @@ def call_llm(
             temperature=agent.temperature,
         )
     raise RuntimeError(f"Unsupported provider: {provider}")
+
+# GEMINI new code 
+def _extract_gemini_text(resp) -> str:
+    """
+    Safely extract text from a google-generativeai response.
+    Avoids resp.text quick accessor, which can raise when no parts exist.
+    """
+    # Try to collect text from candidates/parts
+    chunks = []
+    candidates = getattr(resp, "candidates", None) or []
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        for p in parts:
+            # parts may be objects with .text, or dict-like
+            text = getattr(p, "text", None) or (p.get("text") if isinstance(p, dict) else None)
+            if text:
+                chunks.append(text)
+
+    if chunks:
+        return "\n".join(chunks).strip()
+
+    # Fallback: try the quick accessor, but don't let it crash
+    try:
+        txt = getattr(resp, "text", "") or ""
+        return txt.strip()
+    except Exception:
+        return ""
 
 # ------------------- PIPELINE LOGIC ----------------
 
